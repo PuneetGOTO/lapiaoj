@@ -5,6 +5,7 @@ import os
 import asyncio
 from dotenv import load_dotenv
 import traceback # Import traceback for better error logging
+from typing import List, Optional # For type hinting
 
 # --- Configuration ---
 load_dotenv() # Load variables from .env file for local testing (optional)
@@ -14,42 +15,51 @@ BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 SUPPORT_ROLE_ID_STR = os.getenv("SUPPORT_ROLE_ID")
 TICKET_CATEGORY_ID_STR = os.getenv("TICKET_CATEGORY_ID") # Category for ACTUAL tickets
 LOG_CHANNEL_ID_STR = os.getenv("LOG_CHANNEL_ID") # Optional log channel
-# NEW: Category for the private channels created for new members
+# Category for the private channels created for new/checked members
 NEW_MEMBER_CATEGORY_ID_STR = os.getenv("NEW_MEMBER_CATEGORY_ID")
+# NEW: Comma-separated string of Role IDs that signify a user is 'verified'
+VERIFIED_ROLE_IDS_STR = os.getenv("VERIFIED_ROLE_IDS")
 
 # --- Validate Configuration ---
 CONFIG_ERROR = False
 if not BOT_TOKEN: print("ERROR: DISCORD_BOT_TOKEN missing."); CONFIG_ERROR = True
 if not SUPPORT_ROLE_ID_STR: print("ERROR: SUPPORT_ROLE_ID missing."); CONFIG_ERROR = True
 if not TICKET_CATEGORY_ID_STR: print("ERROR: TICKET_CATEGORY_ID missing."); CONFIG_ERROR = True
-# NEW: Validate the new member category ID
-if not NEW_MEMBER_CATEGORY_ID_STR: print("ERROR: NEW_MEMBER_CATEGORY_ID missing. Cannot create welcome channels."); CONFIG_ERROR = True
+if not NEW_MEMBER_CATEGORY_ID_STR: print("ERROR: NEW_MEMBER_CATEGORY_ID missing."); CONFIG_ERROR = True
+if not VERIFIED_ROLE_IDS_STR: print("ERROR: VERIFIED_ROLE_IDS missing."); CONFIG_ERROR = True
 
 
 SUPPORT_ROLE_ID = None
 TICKET_CATEGORY_ID = None
 LOG_CHANNEL_ID = None # Will be set by command or optional env var
 NEW_MEMBER_CATEGORY_ID = None # NEW
+VERIFIED_ROLE_IDS: List[int] = [] # NEW: Store as a list of integers
 try:
     if SUPPORT_ROLE_ID_STR: SUPPORT_ROLE_ID = int(SUPPORT_ROLE_ID_STR)
     if TICKET_CATEGORY_ID_STR: TICKET_CATEGORY_ID = int(TICKET_CATEGORY_ID_STR)
+    if NEW_MEMBER_CATEGORY_ID_STR: NEW_MEMBER_CATEGORY_ID = int(NEW_MEMBER_CATEGORY_ID_STR)
     if LOG_CHANNEL_ID_STR:
         try:
             LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_STR)
         except ValueError:
             print(f"WARNING: LOG_CHANNEL_ID environment variable ('{LOG_CHANNEL_ID_STR}') is not a valid integer. Log channel must be set via command.")
             LOG_CHANNEL_ID = None # Ensure it's None if invalid
-    # NEW: Parse the new member category ID
-    if NEW_MEMBER_CATEGORY_ID_STR:
-        try:
-            NEW_MEMBER_CATEGORY_ID = int(NEW_MEMBER_CATEGORY_ID_STR)
-        except ValueError:
-            print(f"ERROR: NEW_MEMBER_CATEGORY_ID ('{NEW_MEMBER_CATEGORY_ID_STR}') is not a valid integer.")
-            CONFIG_ERROR = True # Make this error critical
+    # NEW: Parse VERIFIED_ROLE_IDS
+    if VERIFIED_ROLE_IDS_STR:
+        ids_str = VERIFIED_ROLE_IDS_STR.split(',')
+        for id_str in ids_str:
+            try:
+                VERIFIED_ROLE_IDS.append(int(id_str.strip()))
+            except ValueError:
+                print(f"ERROR: Invalid Role ID '{id_str.strip()}' found in VERIFIED_ROLE_IDS.")
+                CONFIG_ERROR = True # Treat invalid ID in the list as a critical error
+        if not VERIFIED_ROLE_IDS: # If parsing resulted in an empty list
+             print("ERROR: VERIFIED_ROLE_IDS contained no valid Role IDs.")
+             CONFIG_ERROR = True
 
 except ValueError:
-    # This catches errors if SUPPORT_ROLE_ID or TICKET_CATEGORY_ID are invalid integers
-    print("ERROR: SUPPORT_ROLE_ID or TICKET_CATEGORY_ID environment variable is not a valid integer.")
+    # This catches errors if SUPPORT_ROLE_ID, TICKET_CATEGORY_ID, or NEW_MEMBER_CATEGORY_ID are invalid integers
+    print("ERROR: Core ID environment variable (Support, Ticket Cat, New Member Cat) is not a valid integer.")
     CONFIG_ERROR = True # Ensure bot exits if core IDs are invalid
 
 if CONFIG_ERROR:
@@ -59,7 +69,7 @@ if CONFIG_ERROR:
 # IMPORTANT: Enable Members Intent!
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True # <<<=== REQUIRED FOR on_member_join
+intents.members = True # <<<=== REQUIRED FOR on_member_join and fetching members
 
 bot = commands.Bot(command_prefix="!", intents=intents) # Prefix needed for Bot class, but we use slash commands
 
@@ -165,34 +175,93 @@ class InfoButtonView(discord.ui.View):
         self.stop()
 
 
+# --- Helper Function to Create Welcome Channel ---
+async def create_welcome_channel_for_member(member: discord.Member, guild: discord.Guild, welcome_category: discord.CategoryChannel, support_role: discord.Role, ticket_panel_channel_name: str) -> Optional[discord.TextChannel]:
+    """Creates a private welcome channel and sends the guidance message. Returns the channel or None on failure."""
+    print(f"Attempting to create/find welcome channel for {member.name} ({member.id})...")
+    # Define permissions
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, embed_links=True, attach_files=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True),
+        support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    }
+    # Sanitize name for channel
+    safe_name = "".join(c for c in member.name if c.isalnum() or c in ['-', '_']).lower() or "member"
+    channel_name = f"welcome-{safe_name[:80]}" # Limit length
+
+    # Check if channel already exists
+    existing_channel = discord.utils.get(welcome_category.text_channels, name=channel_name)
+    if existing_channel:
+        print(f"Welcome channel '{channel_name}' already exists for {member.name}. Sending reminder.")
+        try:
+            # Ensure the member still has perms in the existing channel (they might have been removed manually)
+            current_overwrites = existing_channel.overwrites_for(member)
+            if not current_overwrites.view_channel:
+                 print(f"Member {member.name} lacks view permission in existing channel {existing_channel.name}. Re-applying.")
+                 await existing_channel.set_permissions(member, overwrite=overwrites[member], reason="Re-applying permissions for existing welcome channel")
+
+            await existing_channel.send(f"👋 {member.mention}, 提醒您尽快前往 `{ticket_panel_channel_name}` 完成验证。 <@&{support_role.id}>")
+            return existing_channel # Return existing channel
+        except discord.Forbidden:
+            print(f"Bot lacks permission to send reminder or set perms in existing channel #{existing_channel.name}")
+            return existing_channel # Still return it, maybe manual action needed
+        except Exception as e:
+            print(f"Error sending reminder to existing channel: {e}")
+            return existing_channel
+
+    # Create the channel if it doesn't exist
+    try:
+        welcome_channel = await guild.create_text_channel(
+            name=channel_name, category=welcome_category, overwrites=overwrites,
+            topic=f"引导成员 {member.display_name} 验证", reason=f"为成员 {member.name} 创建引导频道"
+        )
+        print(f"Created welcome channel #{welcome_channel.name} (ID: {welcome_channel.id})")
+    except discord.Forbidden:
+        print(f"ERROR: Bot lacks permissions to create welcome channel for {member.name} in category {welcome_category.id}.")
+        return None # Indicate failure
+    except Exception as e:
+        print(f"ERROR: Failed to create welcome channel for {member.name}: {e}"); traceback.print_exc()
+        return None
+
+    # Send guidance message in the new channel
+    try:
+        guidance_message = (
+            f"欢迎 {member.mention}！看起来您尚未完成身份验证。\n\n" # Adjusted message
+            f"➡️ **请前往 `{ticket_panel_channel_name}` 频道，点击那里的 'Create Ticket' 按钮来开始正式的验证流程。**\n\n"
+            f"我们的客服团队 <@&{support_role.id}> 已经收到通知，会尽快协助您。\n"
+            f"如果在 `{ticket_panel_channel_name}` 遇到问题，您可以在此频道简单说明。"
+        )
+        await welcome_channel.send(guidance_message)
+        print(f"Sent welcome message to #{welcome_channel.name}")
+        return welcome_channel # Return the newly created channel
+    except discord.Forbidden: print(f"ERROR: Bot lacks permission to send messages in #{welcome_channel.name}.")
+    except Exception as e: print(f"ERROR: Failed to send welcome message: {e}"); traceback.print_exc()
+    # Still return channel even if message failed, as the channel itself might be useful
+    return welcome_channel
+
+
 # --- Bot Events ---
 @bot.event
 async def on_ready():
     print(f'Bot logged in as {bot.user}')
     print(f'Monitoring Ticket Category ID: {TICKET_CATEGORY_ID}')
     print(f'Support Role ID: {SUPPORT_ROLE_ID}')
-    if bot.log_channel_id:
-        print(f'Logging Channel ID: {bot.log_channel_id}')
-    else:
-        print('Logging Channel not set. Use /setlogchannel command.')
-    # NEW: Print new member category
-    if NEW_MEMBER_CATEGORY_ID:
-        print(f'New Member Welcome Category ID: {NEW_MEMBER_CATEGORY_ID}')
-    else:
-        # This case should be caught by validation now, but good for clarity
-        print('ERROR: New Member Welcome Category ID not set/invalid. Welcome channel feature disabled.')
+    if bot.log_channel_id: print(f'Logging Channel ID: {bot.log_channel_id}')
+    else: print('Logging Channel not set. Use /setlogchannel command.')
+    if NEW_MEMBER_CATEGORY_ID: print(f'New Member Welcome Category ID: {NEW_MEMBER_CATEGORY_ID}')
+    else: print('ERROR: New Member Welcome Category ID not set/invalid.')
+    if VERIFIED_ROLE_IDS: print(f'Verified Role IDs: {VERIFIED_ROLE_IDS}')
+    else: print('ERROR: Verified Role IDs not set/invalid.')
 
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s).")
-    except Exception as e:
-        print(f"Error syncing slash commands: {e}")
-        traceback.print_exc()
+    except Exception as e: print(f"Error syncing slash commands: {e}"); traceback.print_exc()
     try:
-        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="new members & tickets"))
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="members & tickets"))
         print("Set bot presence successfully.")
-    except Exception as e:
-        print(f"Warning: Could not set bot presence - {e}")
+    except Exception as e: print(f"Warning: Could not set bot presence - {e}")
 
     print('------ Bot is Ready ------')
 
@@ -209,10 +278,9 @@ async def on_guild_channel_create(channel):
     support_role = guild.get_role(SUPPORT_ROLE_ID)
     if not support_role:
         print(f"ERROR: Support Role ID {SUPPORT_ROLE_ID} not found.")
-        # Maybe send a message to the channel if possible?
         try: await channel.send(f"⚠️ **配置错误:** 未找到客服角色 (ID: {SUPPORT_ROLE_ID})。")
         except discord.Forbidden: pass
-        return # Don't proceed if support role isn't found
+        return
 
     try:
         # Apply permissions for support role
@@ -228,7 +296,7 @@ async def on_guild_channel_create(channel):
         print(f"Sent initial message ({sent_message.id}) with info button to ticket #{channel.name}")
 
     except discord.errors.Forbidden:
-        print(f"ERROR: Bot lacks permissions (Manage Roles/Send Messages?) in ticket channel #{channel.name}.")
+        print(f"ERROR: Bot lacks permissions in ticket channel #{channel.name}.")
         try: await channel.send(f"⚠️ **权限错误:** 机器人无法设置权限或发送消息。")
         except discord.Forbidden: pass
     except Exception as e:
@@ -236,84 +304,27 @@ async def on_guild_channel_create(channel):
         traceback.print_exc()
 
 
-# --- NEW: Event handler for new members joining ---
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Handles new members joining the server."""
-    # Ensure NEW_MEMBER_CATEGORY_ID is loaded and valid
-    if not NEW_MEMBER_CATEGORY_ID:
-        print(f"Member {member.name} joined, but NEW_MEMBER_CATEGORY_ID is not configured. Skipping welcome channel.")
-        return
-
+    """Handles new members joining."""
+    if not NEW_MEMBER_CATEGORY_ID: return # Exit if category not set
     guild = member.guild
     support_role = guild.get_role(SUPPORT_ROLE_ID)
     welcome_category = guild.get_channel(NEW_MEMBER_CATEGORY_ID)
 
-    # Double check components before proceeding
-    if not support_role:
-        print(f"ERROR: Support Role {SUPPORT_ROLE_ID} not found. Cannot create welcome channel for {member.name}.")
-        return
-    if not welcome_category or not isinstance(welcome_category, discord.CategoryChannel):
-        print(f"ERROR: New Member Category {NEW_MEMBER_CATEGORY_ID} not found or isn't a category. Cannot create welcome channel for {member.name}.")
+    if not support_role or not welcome_category or not isinstance(welcome_category, discord.CategoryChannel):
+        print(f"Missing config for on_member_join (Support Role or Welcome Category). Skipping for {member.name}")
         return
 
-    print(f"New member joined: {member.name} ({member.id}). Attempting to create welcome channel...")
+    # --- !!! IMPORTANT: EDIT THE CHANNEL NAME BELOW !!! ---
+    ticket_panel_channel_name = "#🛳｜客服中心" # <<<=== REPLACE THIS!
+    # --- !!! IMPORTANT: EDIT THE CHANNEL NAME ABOVE !!! ---
 
-    # Permissions for the private welcome channel
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False), # Hide from @everyone
-        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, embed_links=True, attach_files=True), # Allow member
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True), # Allow bot
-        support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True) # Allow support
-    }
-
-    # Sanitize member name for channel name (basic example)
-    safe_name = "".join(c for c in member.name if c.isalnum() or c in ['-', '_']).lower() or "member"
-    channel_name = f"welcome-{safe_name[:80]}" # Limit length
-
-    try:
-        welcome_channel = await guild.create_text_channel(
-            name=channel_name,
-            category=welcome_category,
-            overwrites=overwrites,
-            topic=f"引导新成员 {member.display_name} 进行验证 | Welcome channel for {member.display_name}",
-            reason=f"自动为新成员 {member.name} 创建引导频道"
-        )
-        print(f"Successfully created welcome channel #{welcome_channel.name} (ID: {welcome_channel.id}) for {member.name}")
-    except discord.Forbidden:
-        print(f"ERROR: Bot lacks permissions (Manage Channels/Roles?) to create welcome channel for {member.name} in category {NEW_MEMBER_CATEGORY_ID}.")
-        # Consider logging this to a specific admin/log channel if possible
-        return
-    except Exception as e:
-        print(f"ERROR: Failed to create welcome channel for {member.name}: {e}")
-        traceback.print_exc()
-        return
-
-    # Send the guidance message
-    try:
-        # --- !!! IMPORTANT: EDIT THE CHANNEL NAME BELOW !!! ---
-        ticket_panel_channel_name = "#频道名-客服中心验证" # <<<=== REPLACE THIS WITH YOUR ACTUAL TICKET PANEL CHANNEL NAME!!!
-        # --- !!! IMPORTANT: EDIT THE CHANNEL NAME ABOVE !!! ---
-
-        guidance_message = (
-            f"欢迎 {member.mention} 加入 **{guild.name}**！🎉\n\n"
-            f"为了确保服务器环境和成员权益，我们需要您先完成身份验证。\n\n"
-            f"➡️ **请前往 `{ticket_panel_channel_name}` 频道，点击那里的 'Create Ticket' 按钮来开始正式的验证流程。**\n\n"
-            f"我们的客服团队 <@&{SUPPORT_ROLE_ID}> 已经收到通知，会尽快协助您完成验证。\n"
-            f"如果在 `{ticket_panel_channel_name}` 遇到问题，您可以在此频道简单说明，客服人员会看到。"
-        )
-
-        await welcome_channel.send(guidance_message)
-        print(f"Sent welcome message to #{welcome_channel.name} for {member.name}")
-
-    except discord.Forbidden:
-        print(f"ERROR: Bot lacks permission to send messages in the created welcome channel #{welcome_channel.name}.")
-    except Exception as e:
-        print(f"ERROR: Failed to send welcome message for {member.name}: {e}")
-        traceback.print_exc()
+    await create_welcome_channel_for_member(member, guild, welcome_category, support_role, ticket_panel_channel_name)
 
 
 # --- Slash Commands ---
+
 # Command: /setlogchannel
 @bot.tree.command(name="setlogchannel", description="设置用于记录已验证用户信息的频道。")
 @app_commands.describe(channel="选择要发送日志的文本频道")
@@ -321,7 +332,7 @@ async def on_member_join(member: discord.Member):
 async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     bot.log_channel_id = channel.id
     print(f"Log channel set to: #{channel.name} (ID: {channel.id}) by {interaction.user}")
-    await interaction.response.send_message(f"✅ 记录频道已设置为 {channel.mention}。\n**提示:** 此设置在机器人重启后会丢失，建议设置 `LOG_CHANNEL_ID` 环境变量。", ephemeral=True)
+    await interaction.response.send_message(f"✅ 记录频道已设置为 {channel.mention}。\n**提示:** 建议设置 `LOG_CHANNEL_ID` 环境变量以持久化。", ephemeral=True)
 
 @set_log_channel.error
 async def set_log_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -336,16 +347,15 @@ async def set_log_channel_error(interaction: discord.Interaction, error: app_com
 def is_in_ticket_category():
     async def predicate(interaction: discord.Interaction) -> bool:
         if TICKET_CATEGORY_ID is None: return False
-        # Check if channel exists and has a category attribute
         if interaction.channel and hasattr(interaction.channel, 'category_id'):
             return interaction.channel.category_id == TICKET_CATEGORY_ID
-        return False # Not a channel with a category or channel doesn't exist
+        return False
     return app_commands.check(predicate)
 
 # Command: /verifyticket
 @bot.tree.command(name="verifyticket", description="确认当前 Ticket 用户身份已验证，并记录信息。")
-@is_in_ticket_category() # Check if command is used in the correct category
-@app_commands.checks.has_role(SUPPORT_ROLE_ID) # Check if user has the support role
+@is_in_ticket_category()
+@app_commands.checks.has_role(SUPPORT_ROLE_ID)
 async def verify_ticket(interaction: discord.Interaction):
     channel_id = interaction.channel_id
 
@@ -402,19 +412,89 @@ async def verify_ticket(interaction: discord.Interaction):
 
 @verify_ticket.error
 async def verify_ticket_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-     if isinstance(error, app_commands.CheckFailure): await interaction.response.send_message("❌ 此命令只能由指定客服人员在有效的 Ticket 分类频道中使用。", ephemeral=True)
-     elif isinstance(error, app_commands.MissingRole): await interaction.response.send_message("❌ 你没有所需的客服角色来使用此命令。", ephemeral=True)
-     else: print(f"Error in /verifyticket: {error}"); traceback.print_exc(); await interaction.response.send_message("处理验证命令时发生未知错误。", ephemeral=True)
+     if isinstance(error, app_commands.CheckFailure) or isinstance(error, app_commands.MissingRole):
+         await interaction.response.send_message("❌ 此命令只能由指定客服人员在有效的 Ticket 分类频道中使用。", ephemeral=True)
+     else:
+         print(f"Error in /verifyticket: {error}")
+         traceback.print_exc()
+         await interaction.response.send_message("处理验证命令时发生未知错误。", ephemeral=True)
+
+
+# --- NEW: Slash Command to Check Existing Members ---
+@bot.tree.command(name="checkmemberverify", description="检查指定成员是否需要验证，并为其创建引导频道(如果需要)。")
+@app_commands.describe(member="选择要检查的服务器成员")
+@app_commands.checks.has_any_role(SUPPORT_ROLE_ID) # Check if user has the support role
+async def check_member_verification(interaction: discord.Interaction, member: discord.Member):
+    """Checks if an existing member lacks verified roles and initiates the welcome process."""
+
+    # Ensure required configurations are loaded
+    if not VERIFIED_ROLE_IDS:
+        await interaction.response.send_message("❌ **错误:** 未配置“已验证”角色ID (`VERIFIED_ROLE_IDS`)。", ephemeral=True); return
+    if not NEW_MEMBER_CATEGORY_ID:
+        await interaction.response.send_message("❌ **错误:** 未配置“新成员欢迎分类”ID (`NEW_MEMBER_CATEGORY_ID`)。", ephemeral=True); return
+    if not SUPPORT_ROLE_ID:
+         await interaction.response.send_message("❌ **错误:** 未配置“客服支持角色”ID (`SUPPORT_ROLE_ID`)。", ephemeral=True); return
+
+    guild = interaction.guild
+    support_role = guild.get_role(SUPPORT_ROLE_ID)
+    welcome_category = guild.get_channel(NEW_MEMBER_CATEGORY_ID)
+
+    # Re-check fetched objects
+    if not support_role or not welcome_category or not isinstance(welcome_category, discord.CategoryChannel):
+         await interaction.response.send_message("❌ **配置错误:** 无法找到客服角色或新成员欢迎分类。", ephemeral=True); return
+
+    # Check if the member has any of the verified roles
+    member_role_ids = {role.id for role in member.roles}
+    has_verified_role = any(verified_id in member_role_ids for verified_id in VERIFIED_ROLE_IDS)
+
+    if has_verified_role:
+        await interaction.response.send_message(f"✅ 用户 {member.mention} **已拥有**指定的验证身份组之一，无需再次验证。", ephemeral=True)
+        return
+    else:
+        # Member needs verification, initiate the welcome channel process
+        await interaction.response.send_message(f"⏳ 用户 {member.mention} **没有**验证身份组。正在为其创建/检查引导频道...", ephemeral=True)
+
+        # --- !!! IMPORTANT: EDIT THE CHANNEL NAME BELOW !!! ---
+        ticket_panel_channel_name = "#🛳｜客服中心" # <<<=== REPLACE THIS!
+        # --- !!! IMPORTANT: EDIT THE CHANNEL NAME ABOVE !!! ---
+
+        # Call the helper function to create/find the channel and send message
+        created_channel = await create_welcome_channel_for_member(member, guild, welcome_category, support_role, ticket_panel_channel_name)
+
+        # Edit the initial ephemeral response based on the helper function result
+        if created_channel:
+            await interaction.edit_original_response(content=f"✅ 已为 {member.mention} 创建/找到引导频道 {created_channel.mention}，并已发送指示。请客服人员跟进。")
+        else:
+            await interaction.edit_original_response(content=f"❌ 为 {member.mention} 创建引导频道时失败，请检查机器人权限和服务器设置。")
+
+
+@check_member_verification.error
+async def check_member_verification_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingAnyRole):
+         await interaction.response.send_message("❌ 你没有权限使用此命令 (需要客服角色)。", ephemeral=True)
+    # Add other specific error checks if needed (e.g., MemberNotFound, though unlikely with slash command)
+    else:
+        print(f"Error in /checkmemberverify: {error}")
+        traceback.print_exc()
+        await interaction.response.send_message("检查成员验证状态时发生未知错误。", ephemeral=True)
+
 
 # --- Run the Bot ---
 if __name__ == "__main__":
     # Check if all *required* IDs are loaded before starting
-    if BOT_TOKEN and SUPPORT_ROLE_ID and TICKET_CATEGORY_ID and NEW_MEMBER_CATEGORY_ID:
+    if BOT_TOKEN and SUPPORT_ROLE_ID and TICKET_CATEGORY_ID and NEW_MEMBER_CATEGORY_ID and VERIFIED_ROLE_IDS:
         try:
             print("Attempting to run the bot...")
             bot.run(BOT_TOKEN)
         except discord.errors.LoginFailure: print("CRITICAL ERROR: Invalid Discord Bot Token provided.")
-        except discord.errors.PrivilegedIntentsRequired: print("CRITICAL ERROR: Privileged Gateway Intents ('Members') are required but not enabled in the Discord Developer Portal.")
+        except discord.errors.PrivilegedIntentsRequired: print("CRITICAL ERROR: Privileged Gateway Intents ('Members') are required but not enabled.")
         except Exception as e: print(f"CRITICAL ERROR: Failed to start the bot - {e}"); traceback.print_exc()
     else:
-        print("CRITICAL ERROR: Bot cannot start due to missing core configuration (Token, Role ID, Ticket Category ID, or New Member Category ID). Check environment variables.")
+        # Be more specific about which config is missing
+        missing_configs = []
+        if not BOT_TOKEN: missing_configs.append("BOT_TOKEN")
+        if not SUPPORT_ROLE_ID: missing_configs.append("SUPPORT_ROLE_ID")
+        if not TICKET_CATEGORY_ID: missing_configs.append("TICKET_CATEGORY_ID")
+        if not NEW_MEMBER_CATEGORY_ID: missing_configs.append("NEW_MEMBER_CATEGORY_ID")
+        if not VERIFIED_ROLE_IDS: missing_configs.append("VERIFIED_ROLE_IDS")
+        print(f"CRITICAL ERROR: Bot cannot start due to missing core configuration: {', '.join(missing_configs)}. Check environment variables.")
